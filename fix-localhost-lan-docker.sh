@@ -1,111 +1,94 @@
 #!/usr/bin/env bash
-# Fix localhost, LAN, and Docker routing when GlobalProtect is connected.
-# Ubuntu 24.04 tested. Safe to run repeatedly.
+# Hybrid fix: stable subnet detection + smart cleanup of VPN-pushed routes
+# Also enforces NO_PROXY settings and proxy bypass for localhost.
 
 set -euo pipefail
 
-# ====== CONFIG (override via env or edit below) ======
-LAN_IF="${LAN_IF:-wlp0s20f3}"        # your LAN/Wi-Fi iface (ip -br link)
-LAN_GW="${LAN_GW:-192.168.8.1}"      # your LAN router/gateway
-RESTORE_DEFAULT=0                    # set via --restore-default flag
+LAN_IF="${LAN_IF:-wlp0s20f3}"   # your LAN/Wi-Fi iface
+LAN_GW="${LAN_GW:-192.168.8.1}" # your LAN router/gateway
+RESTORE_DEFAULT=0
 [[ "${1:-}" == "--restore-default" ]] && RESTORE_DEFAULT=1
-# =====================================================
 
 log(){ printf "%s %s\n" "$(date +'%H:%M:%S')" "$*"; }
 
-need_iface() {
-  if ! ip link show "$1" >/dev/null 2>&1; then
-    log "[!] Interface '$1' not found. Override LAN_IF/LAN_GW as env vars."
-    exit 1
-  fi
-}
-
-# Return subnets for an interface
-cidrs_for_iface() {
-  local IF="$1"
-  local found=0
-  # Prefer kernel routes
-  while read -r CIDR; do
-    [[ -n "$CIDR" ]] || continue
-    echo "$CIDR"; found=1
-  done < <(ip route | awk -v IF="$IF" '$0 ~ (" dev "IF" ") && /proto kernel/ && /scope link/ {print $1}')
-  # Fallback to derive from iface IP(s)
-  if [[ $found -eq 0 ]]; then
-    while read -r ADDR; do
-      [[ -z "$ADDR" ]] && continue
-      python3 - <<PY
-import ipaddress, sys
-cidr=sys.argv[1]
-net=ipaddress.ip_network(cidr, strict=False)
-print(f"{net.network_address}/{net.prefixlen}")
-PY
-      "$ADDR"
-    done < <(ip -o -4 addr show dev "$IF" | awk '{print $4}')
-  fi
-}
-
 # --- 0) Sanity ---
-need_iface "$LAN_IF"
-
-# --- 1) Ensure /etc/hosts has localhost ---
-log "[*] Checking /etc/hosts for localhost..."
-if ! getent hosts localhost | grep -q "127.0.0.1"; then
-  log "[!] Fixing /etc/hosts localhost entry"
-  sudo sed -i '/[[:space:]]localhost$/d' /etc/hosts
-  echo "127.0.0.1   localhost" | sudo tee -a /etc/hosts >/dev/null
-  grep -q '^::1[[:space:]]\+localhost' /etc/hosts || echo "::1   localhost" | sudo tee -a /etc/hosts >/dev/null
-else
-  log "[✓] /etc/hosts is fine"
+if ! ip link show "$LAN_IF" >/dev/null 2>&1; then
+  log "[!] LAN_IF '$LAN_IF' not found. Override with LAN_IF=…"
+  exit 1
 fi
 
-# --- 2) Pin 127.0.0.0/8 to lo ---
-log "[*] Ensuring 127.0.0.0/8 via lo..."
-sudo ip route replace 127.0.0.0/8 dev lo metric 0 || true
+# --- 1) Ensure /etc/hosts has both IPv4 + IPv6 localhost ---
+log "[*] Checking /etc/hosts for localhost entries..."
+if ! grep -qE '^127\.0\.0\.1[[:space:]]+localhost' /etc/hosts; then
+  echo "127.0.0.1   localhost" | sudo tee -a /etc/hosts >/dev/null
+  log "[!] Added missing IPv4 localhost to /etc/hosts"
+fi
+if ! grep -qE '^::1[[:space:]]+localhost' /etc/hosts; then
+  echo "::1   localhost" | sudo tee -a /etc/hosts >/dev/null
+  log "[!] Added missing IPv6 localhost to /etc/hosts"
+fi
 
-# --- 3) Protect LAN ---
-for CIDR in $(cidrs_for_iface "$LAN_IF"); do
+# --- 2) Ensure NO_PROXY env vars include localhost ---
+log "[*] Enforcing NO_PROXY environment variables..."
+for VAR in NO_PROXY no_proxy; do
+  if ! grep -q "$VAR=localhost,127.0.0.1,::1" "$HOME/.bashrc" "$HOME/.zshrc" 2>/dev/null; then
+    echo "export $VAR=localhost,127.0.0.1,::1" >> "$HOME/.bashrc"
+    echo "export $VAR=localhost,127.0.0.1,::1" >> "$HOME/.zshrc"
+    log "[!] Added $VAR to ~/.bashrc and ~/.zshrc"
+  fi
+done
+
+# --- 3) Enforce GNOME proxy ignore-hosts ---
+if command -v gsettings >/dev/null 2>&1; then
+  log "[*] Updating GNOME proxy ignore-hosts..."
+  gsettings set org.gnome.system.proxy ignore-hosts "['localhost','127.0.0.1','::1']" || true
+fi
+
+# --- 4) Pin localhost route ---
+sudo ip route replace 127.0.0.0/8 dev lo metric 0
+
+# --- 5) Protect LAN ---
+for CIDR in $(ip -o -4 addr show dev "$LAN_IF" | awk '{print $4}'); do
   [[ -z "$CIDR" ]] && continue
-  log "[*] Protecting LAN subnet $CIDR via $LAN_IF"
+  log "[*] Protecting LAN $CIDR via $LAN_IF"
   sudo ip route replace "$CIDR" dev "$LAN_IF" scope link metric 0 || true
 done
 
 # Remove VPN-pushed LAN routes
-ip route | awk '$1 ~ /^192\.168\./ && $0 ~ / dev gpd[0-9]+/ {print $1}' \
+ip route | awk '$1 ~ /^192\.168\./ && / dev gpd[0-9]+/ {print $1}' \
 | while read -r NET; do
-  log "[!] Removing VPN LAN route $NET via gpd"
+  log "[!] Removing VPN LAN $NET via gpd"
   sudo ip route del "$NET" dev gpd0 2>/dev/null || true
 done
 
-# Ensure LAN supernet always wins
+# Ensure LAN supernet wins
 sudo ip route replace 192.168.0.0/16 via "$LAN_GW" dev "$LAN_IF" metric 0 || true
 
-# Optionally restore default
+# --- 6) Restore default route if requested ---
 DEF_DEV=$(ip route show default | awk '/default/ {print $5; exit}')
 if [[ $RESTORE_DEFAULT -eq 1 && "$DEF_DEV" =~ ^gpd[0-9]+$ ]]; then
-  log "[!] Restoring default route to LAN via $LAN_GW"
   sudo ip route del default || true
   sudo ip route add default via "$LAN_GW" dev "$LAN_IF" metric 100 || true
+  log "[!] Restored default route to LAN"
 else
-  log "[i] Not touching default route."
+  log "[i] Not touching default route"
 fi
 
-# --- 4) Protect Docker ---
+# --- 7) Protect Docker ---
 mapfile -t DOCKER_IFS < <(ip -o link | awk -F': ' '{print $2}' | grep -E '^(docker[0-9]*|br-.+)$' || true)
 if [[ ${#DOCKER_IFS[@]} -gt 0 ]]; then
   log "[*] Protecting Docker networks..."
   for IF in "${DOCKER_IFS[@]}"; do
-    for CIDR in $(cidrs_for_iface "$IF"); do
+    for CIDR in $(ip -o -4 addr show dev "$IF" | awk '{print $4}'); do
       [[ -z "$CIDR" ]] && continue
-      log "    - Pin $CIDR via $IF"
-      sudo ip route replace "$CIDR" dev "$IF" metric 0 || true
-      # Remove VPN duplicates
-      sudo ip route del "$CIDR" dev gpd0 2>/dev/null || true
+      NET=$(echo "$CIDR" | cut -d/ -f1 | awk -F. '{printf "%s.%s.%s.0/%s\n",$1,$2,$3,substr("'"$CIDR"'", index("'"$CIDR"'", "/")+1)}')
+      [[ -z "$NET" ]] && NET="$CIDR"
+      log "    - Pin $NET via $IF"
+      sudo ip route replace "$NET" dev "$IF" metric 0 || true
+      sudo ip route del "$NET" dev gpd0 2>/dev/null || true
     done
   done
 fi
 
-# --- 5) Summary ---
-log "[*] Summary:"
-ip route get 127.0.0.1 | sed 's/^/   /'
-ip route | grep -E '(^default| docker0| br-| lo |'"$LAN_IF"'| gpd[0-9])' | sed 's/^/   /' || true
-log "[✓] Done."
+log "[✓] Done. Current key routes:"
+ip route | grep -E '(^default| gpd0| lo |docker0|br-|'"$LAN_IF"')'
