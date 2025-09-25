@@ -1,6 +1,7 @@
 # vpn-fix-localhost
 ## How to use
 nano ~/fix-localhost-lan-docker.sh   # paste the script
+
 chmod +x ~/fix-localhost-lan-docker.sh
 
 ### Run it (does NOT change default route)
